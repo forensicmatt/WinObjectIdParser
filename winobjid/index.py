@@ -10,40 +10,98 @@ class InvalidIndexPageHeader(Exception):
         super(InvalidIndexPageHeader, self).__init__(message)
 
 
+class InvalidEntryFlag(Exception):
+    def __init__(self, message):
+        super(InvalidEntryFlag, self).__init__(message)
+
+
 class IndexOEntry(object):
-    def __init__(self, buf, offset=None):
+    def __init__(self, buf, offset=None, recover=False):
         self._offset = offset
+        self._recovered = recover
         logging.debug("Index Entry at Offset: {}".format(self._offset))
-        offset = struct.unpack("<H", buf[0:2])[0]
-        size = struct.unpack("<H", buf[2:4])[0]
-        self._buffer = buf[0:offset+size]
+        flag = struct.unpack("<H", buf[12:14])[0]
+        if flag == 2:
+            self._buffer = buf[0:88]
+        elif flag in [0, 1]:
+            data_offset = struct.unpack("<H", buf[0:2])[0]
+            data_size = struct.unpack("<H", buf[2:4])[0]
+            self._buffer = buf[0:data_offset+data_size]
+        elif flag == 3:
+            # This seems to be the end of the last page flag.
+            self._buffer = buf[0:88]
+        else:
+            raise(
+                InvalidEntryFlag(
+                    "Invalid entry flag of {} at offset {}.".format(
+                        flag, self._offset
+                    )
+                )
+            )
+
+    def is_last_entry(self):
+        if self.flags in [2, 3]:
+            return True
+        return False
 
     def get_offset(self):
         return self._offset
 
+    def is_valid(self):
+        """Check if valid record. This is useful for unallocated parsing.
+        """
+        if self.flags == 2:
+            if self._buffer[0:8] == "\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00":
+                # This is a end record
+                return True
+        else:
+            if self.flags in [0, 1]:
+                if self.data_offset == 32:
+                    if self.data_size == 56:
+                        if self.entry_size == 88:
+                            if self.key_size == 16:
+                                return True
+        return False
+
+    def is_empty(self):
+        if self._buffer[14:] == b"\x00"*74:
+            return True
+        return False
+
     @property
     def data_offset(self):
-        """This should be 32"""
+        """This should be 32 [0x20]"""
         return struct.unpack("<H", self._buffer[0:2])[0]
 
     @property
     def data_size(self):
-        """This should be 56"""
+        """This should be 56 [0x38]"""
         return struct.unpack("<H", self._buffer[2:4])[0]
 
     @property
+    def padding1(self):
+        return struct.unpack("<I", self._buffer[4:8])[0]
+
+    @property
     def entry_size(self):
-        """This should be 88"""
-        return struct.unpack("<H", self._buffer[8:10])[0]
+        """This should be 88 [0x58]"""
+        if self.flags in [0, 1, 3]:
+            entry_size = struct.unpack("<H", self._buffer[8:10])[0]
+        else:
+            entry_size = 88
+
+        return entry_size
 
     @property
     def key_size(self):
-        """This should be 16"""
+        """This should be 16 [0x10]"""
         return struct.unpack("<H", self._buffer[10:12])[0]
 
     @property
     def flags(self):
-        """1 = Entry has subnodes; 2 = Last Entry"""
+        """1 = Entry has subnodes; 2 = Last Entry
+        3 appears to be the last index in the file?
+        """
         return struct.unpack("<H", self._buffer[12:14])[0]
 
     @property
@@ -71,6 +129,7 @@ class IndexOEntry(object):
     def as_dict(self):
         return {
             "offset": self._offset,
+            "recovered": self._recovered,
             "flags": self.flags,
             "object_id": self.object_id.as_dict(),
             "mft_reference": self.mft_reference.as_dict(),
@@ -122,18 +181,31 @@ class IndexHeader(object):
 
     @property
     def index_entry_offset(self):
+        # relative to offset 24
         return struct.unpack("<I", self._buffer[24:28])[0]
 
     @property
     def index_entry_size(self):
+        """The size of the allocated entries block from the beginning
+        of the index page.
+        This value + 8 seems to point to the start of the end entry with
+        a flag of 2 (the end entry has a flag of 2, but seems to be a
+        have duplicate values of the last record).
+        """
         return struct.unpack("<I", self._buffer[28:32])[0]
 
     @property
     def allocated_index_entry_size(self):
+        """The size allocated for entries.
+        This value + 24 + index_entry_offset will equal the size complete
+        size of the INDX page.
+        """
         return struct.unpack("<I", self._buffer[32:36])[0]
 
     @property
     def leaf_node(self):
+        """1 appears to indicate the last allocated page of the file.
+        """
         return struct.unpack("<B", self._buffer[36:37])[0]
 
     @property
@@ -141,6 +213,19 @@ class IndexHeader(object):
         return binascii.b2a_hex(
             self._buffer[40:42]
         )
+
+    def as_dict(self):
+        return {
+            "signature": self.signature.hex(),
+            "update_sequence_offset": self.update_sequence_offset,
+            "update_sequence_size": self.update_sequence_size,
+            "logfile_sequence_number": self.logfile_sequence_number,
+            "vcn": self.vcn,
+            "index_entry_offset": self.index_entry_offset,
+            "index_entry_size": self.index_entry_size,
+            "allocated_index_entry_size": self.allocated_index_entry_size,
+            "leaf_node": self.leaf_node
+        }
 
 
 class IndexPage(object):
@@ -173,6 +258,11 @@ class IndexPage(object):
     def get_page_size(self):
         return self.header.block_size()
 
+    def is_valid(self):
+        if self.header.signature == b"INDX":
+            return True
+        return False
+
     def _fix_raw_block(self):
         """Apply the update sequence array to their respected offsets.
         """
@@ -187,23 +277,42 @@ class IndexPage(object):
 
     def iter_entries(self):
         pointer = self.header.index_entry_offset + 24
-        entry = IndexOEntry(
-            self._index_block_buf[pointer:],
-            offset=self._offset+pointer
-        )
-        pointer += entry.entry_size
 
         while True:
-            yield entry
-
-            if pointer >= self.header.index_entry_size:
-                break
-
             entry = IndexOEntry(
                 self._index_block_buf[pointer:],
-                offset=self._offset+pointer
+                offset=self._offset + pointer
             )
+            if entry.is_last_entry():
+                break
+
             pointer += entry.entry_size
+
+            yield entry
+
+    def iter_unalloc_entries(self):
+        pointer = self.header.index_entry_size
+        if not self.header.leaf_node:
+            pointer += 8
+
+        while True:
+            if len(self._index_block_buf[pointer:]) > 88:
+                entry = IndexOEntry(
+                    self._index_block_buf[pointer:],
+                    recover=True,
+                    offset=self._offset + pointer
+                )
+
+                if entry.is_empty():
+                    break
+
+                if entry.flags == 3:
+                    break
+
+                pointer += 88
+                yield entry
+            else:
+                break
 
 
 class ObjectIndexFile(object):
@@ -215,29 +324,27 @@ class ObjectIndexFile(object):
         self._file_handle.seek(0, 0)
 
     def iter_index_pages(self):
-        index = IndexPage(
-            self._file_handle,
-            offset=self._offset
-        )
-        self._offset += index.get_page_size()
-
         while True:
-            yield index
-
-            if self._offset == self._file_size:
-                break
-
-            self._file_handle.seek(
-                self._offset
-            )
-
             try:
                 index = IndexPage(
                     self._file_handle,
                     offset=self._offset
                 )
             except InvalidIndexPageHeader as error:
-                logging.error(error)
+                logging.error("{}".format(error))
+                break
+            except Exception as error:
+                logging.error("{}".format(error))
                 break
 
+            logging.info("{}".format(index.header.as_dict()))
             self._offset += index.get_page_size()
+
+            yield index
+
+            if self._offset >= self._file_size:
+                break
+
+            self._file_handle.seek(
+                self._offset
+            )

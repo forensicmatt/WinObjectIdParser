@@ -39,6 +39,14 @@ def get_arguments():
         help="The $O Index or a logical volume (logical volume: \\\\.\\C:)."
     )
     arguments.add_argument(
+        "--no_recover",
+        dest="no_recover",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Do Not Recover Object Entries."
+    )
+    arguments.add_argument(
         "-o", "--output_template",
         dest="output_template",
         action="store",
@@ -87,6 +95,19 @@ def parse_logical(options):
                         json.dumps(entry.as_dict())
                     )
 
+            if not options.no_recover:
+                for unalloc_entry in index_page.iter_unalloc_entries():
+                    if out_template:
+                        print(
+                            out_template.format(
+                                **unalloc_entry.as_dict()
+                            )
+                        )
+                    else:
+                        print(
+                            json.dumps(unalloc_entry.as_dict())
+                        )
+
 
 def parse_file(options):
     out_template = None
@@ -110,6 +131,18 @@ def parse_file(options):
                     print(
                         json.dumps(entry.as_dict())
                     )
+            if not options.no_recover:
+                for unalloc_entry in index_page.iter_unalloc_entries():
+                    if out_template:
+                        print(
+                            out_template.format(
+                                **unalloc_entry.as_dict()
+                            )
+                        )
+                    else:
+                        print(
+                            json.dumps(unalloc_entry.as_dict())
+                        )
 
 
 def main():
